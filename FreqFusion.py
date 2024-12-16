@@ -1,66 +1,17 @@
-# TPAMI 2024：Frequency-aware Feature Fusion for Dense Image Prediction
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmcv.ops.carafe import normal_init, xavier_init, carafe
 from torch.utils.checkpoint import checkpoint
 import warnings
+from pytorch_wavelets import DWTForward
 import numpy as np
 
-try:
-    from mmcv.ops.carafe import normal_init, xavier_init, carafe
-except ImportError:
-
-    def xavier_init(module: nn.Module,
-                    gain: float = 1,
-                    bias: float = 0,
-                    distribution: str = 'normal') -> None:
-        assert distribution in ['uniform', 'normal']
-        if hasattr(module, 'weight') and module.weight is not None:
-            if distribution == 'uniform':
-                nn.init.xavier_uniform_(module.weight, gain=gain)
-            else:
-                nn.init.xavier_normal_(module.weight, gain=gain)
-        if hasattr(module, 'bias') and module.bias is not None:
-            nn.init.constant_(module.bias, bias)
-
-    def carafe(x, normed_mask, kernel_size, group=1, up=1):
-            b, c, h, w = x.shape
-            _, m_c, m_h, m_w = normed_mask.shape
-            print('x', x.shape)
-            print('normed_mask', normed_mask.shape)
-            # assert m_c == kernel_size ** 2 * up ** 2
-            assert m_h == up * h
-            assert m_w == up * w
-            pad = kernel_size // 2
-            # print(pad)
-            pad_x = F.pad(x, pad=[pad] * 4, mode='reflect')
-            # print(pad_x.shape)
-            unfold_x = F.unfold(pad_x, kernel_size=(kernel_size, kernel_size), stride=1, padding=0)
-            # unfold_x = unfold_x.reshape(b, c, 1, kernel_size, kernel_size, h, w).repeat(1, 1, up ** 2, 1, 1, 1, 1)
-            unfold_x = unfold_x.reshape(b, c * kernel_size * kernel_size, h, w)
-            unfold_x = F.interpolate(unfold_x, scale_factor=up, mode='nearest')
-            # normed_mask = normed_mask.reshape(b, 1, up ** 2, kernel_size, kernel_size, h, w)
-            unfold_x = unfold_x.reshape(b, c, kernel_size * kernel_size, m_h, m_w)
-            normed_mask = normed_mask.reshape(b, 1, kernel_size * kernel_size, m_h, m_w)
-            res = unfold_x * normed_mask
-            # test
-            # res[:, :, 0] = 1
-            # res[:, :, 1] = 2
-            # res[:, :, 2] = 3
-            # res[:, :, 3] = 4
-            res = res.sum(dim=2).reshape(b, c, m_h, m_w)
-            # res = F.pixel_shuffle(res, up)
-            # print(res.shape)
-            # print(res)
-            return res
-
-    def normal_init(module, mean=0, std=1, bias=0):
-        if hasattr(module, 'weight') and module.weight is not None:
-            nn.init.normal_(module.weight, mean, std)
-        if hasattr(module, 'bias') and module.bias is not None:
-            nn.init.constant_(module.bias, bias)
-
+def normal_init(module, mean=0, std=1, bias=0):
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.normal_(module.weight, mean, std)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
 
 def constant_init(module, val, bias=0):
     if hasattr(module, 'weight') and module.weight is not None:
@@ -89,6 +40,47 @@ def resize(input,
                         f'out size {(output_h, output_w)} is `nx+1`')
     return F.interpolate(input, size, scale_factor, mode, align_corners)
 
+class FeatureFusionWithSelfAttention(nn.Module):
+    def __init__(self, dropout: float = 0.1):
+        """
+        初始化自注意力机制模块。
+        :param dropout: 自注意力的 dropout 概率。
+        """
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+    def _self_attention(self, x):
+        """
+        自注意力模块。
+        :param x: 输入特征 (B, C, H, W)
+        :return: 增强后的特征 (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        x_reshaped = x.view(B, C, -1)  # (B, C, H*W)
+
+        # 计算自注意力
+        query = x_reshaped.transpose(1, 2)  # (B, H*W, C)
+        key = x_reshaped  # (B, C, H*W)
+        value = x_reshaped  # (B, C, H*W)
+
+        attention_weights = torch.bmm(query, key)  # (B, H*W, H*W)
+        attention_weights = F.softmax(attention_weights / (C ** 0.5), dim=-1)  # 归一化
+
+        attn_output = torch.bmm(attention_weights, value.transpose(1, 2))  # (B, H*W, C)
+        attn_output = attn_output.transpose(1, 2).view(B, C, H, W)  # (B, C, H, W)
+
+        return x + self.dropout(attn_output)  # 残差连接
+
+    def forward(self, hr_feat, lr_feat):
+        """
+        自注意力增强特征。
+        :param hr_feat: 高分辨率特征 (B, C, H, W)
+        :param lr_feat: 低分辨率特征 (B, C, H, W)
+        :return: 增强后的 hr_feat 和 lr_feat
+        """
+        hr_feat = self._self_attention(hr_feat)
+        lr_feat = self._self_attention(lr_feat)
+        return hr_feat, lr_feat
 def hamming2D(M, N):
     """
     生成二维Hamming窗
@@ -108,6 +100,18 @@ def hamming2D(M, N):
     # 通过外积生成二维Hamming窗
     hamming_2d = np.outer(hamming_x, hamming_y)
     return hamming_2d
+#NEW
+class CustomMultiheadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, output_dim):
+        super(CustomMultiheadAttention, self).__init__()
+        self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.linear = nn.Linear(embed_dim, output_dim)
+
+    def forward(self, x, key_padding_mask=None, attn_mask=None):
+        attn_output = self.mha(x, x, x, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=False)
+        transformed_output = self.linear(attn_output)
+        return transformed_output
+#NEW
 
 class FreqFusion(nn.Module):
     def __init__(self,
@@ -130,7 +134,10 @@ class FreqFusion(nn.Module):
                 hr_residual=True,
                 semi_conv=True,
                 hamming_window=True, # for regularization, do not matter really
-                feature_resample_norm=True,
+                # pca_components=16,
+                feature_resample_norm = True,
+                dropout = 0.1, 
+                # up_group=1, 
                 **kwargs):
         super().__init__()
         self.scale_factor = scale_factor
@@ -143,7 +150,7 @@ class FreqFusion(nn.Module):
         self.hr_channel_compressor = nn.Conv2d(hr_channels, self.compressed_channels,1)
         self.lr_channel_compressor = nn.Conv2d(lr_channels, self.compressed_channels,1)
         self.content_encoder = nn.Conv2d( # ALPF generator
-            self.compressed_channels,
+            self.compressed_channels ,
             lowpass_kernel ** 2 * self.up_group * self.scale_factor * self.scale_factor,
             self.encoder_kernel,
             padding=int((self.encoder_kernel - 1) * self.encoder_dilation / 2),
@@ -162,13 +169,38 @@ class FreqFusion(nn.Module):
             self.dysampler = LocalSimGuidedSampler(in_channels=compressed_channels, scale=2, style='lp', groups=feature_resample_group, use_direct_scale=True, kernel_size=encoder_kernel, norm=feature_resample_norm)
         if self.use_high_pass:
             self.content_encoder2 = nn.Conv2d( # AHPF generator
-                self.compressed_channels,
+                self.compressed_channels ,
+                highpass_kernel ** 2 * self.up_group * self.scale_factor * self.scale_factor,
+                self.encoder_kernel,
+                padding=int((self.encoder_kernel - 1) * self.encoder_dilation / 2),
+                dilation=self.encoder_dilation,
+                groups=1)
+            self.content_encoder3 = nn.Conv2d(
+                self.compressed_channels * 3,  # 输入通道为 high_freq_combined 的通道数
                 highpass_kernel ** 2 * self.up_group * self.scale_factor * self.scale_factor,
                 self.encoder_kernel,
                 padding=int((self.encoder_kernel - 1) * self.encoder_dilation / 2),
                 dilation=self.encoder_dilation,
                 groups=1)
         self.hamming_window = hamming_window
+        ##xinjia
+        self.self_attention_module = FeatureFusionWithSelfAttention(dropout=0.1)
+        
+        # 高低频处理相关
+        self.use_high_pass = use_high_pass
+        self.hr_residual = hr_residual
+        self.lowpass_kernel = lowpass_kernel
+        self.highpass_kernel = highpass_kernel
+        self.up_group = up_group
+        self.feature_resample = feature_resample
+        
+        # 其他标志
+        self.semi_conv = True
+        self.comp_feat_upsample = True
+        self.upsample_mode = 'nearest'
+        self.align_corners = None
+        self.dwt = DWTForward(J=1, wave='haar', mode='zero') 
+        ##xinjia
         lowpass_pad=0
         highpass_pad=0
         if self.hamming_window:
@@ -192,7 +224,7 @@ class FreqFusion(nn.Module):
         if scale_factor is not None:
             mask = F.pixel_shuffle(mask, self.scale_factor)
         n, mask_c, h, w = mask.size()
-        mask_channel = int(mask_c / float(kernel**2)) # group
+        mask_channel = int(mask_c / float(kernel**2))
         # mask = mask.view(n, mask_channel, -1, h, w)
         # mask = F.softmax(mask, dim=2, dtype=mask.dtype)
         # mask = mask.view(n, mask_c, h, w).contiguous()
@@ -210,48 +242,87 @@ class FreqFusion(nn.Module):
         mask =  mask.permute(0, 1, 4, 2, 3).view(n, -1, h, w).contiguous()
         return mask
 
-    def forward(self, hr_feat, lr_feat, use_checkpoint=False): # use check_point to save GPU memory
+    def forward(self, hr_feat, lr_feat, use_checkpoint=False):
         if use_checkpoint:
             return checkpoint(self._forward, hr_feat, lr_feat)
         else:
             return self._forward(hr_feat, lr_feat)
-
     def _forward(self, hr_feat, lr_feat):
+        # 压缩高低分辨率特征
         compressed_hr_feat = self.hr_channel_compressor(hr_feat)
         compressed_lr_feat = self.lr_channel_compressor(lr_feat)
+
+        # 小波分解以提取低频和高频成分
+        low_freq, high_freq = self.dwt(compressed_hr_feat)  # 获取低频和高频部分
+
+#         # Debug: 输出 low_freq 和 high_freq 的形状
+#         print(f"low_freq shape: {low_freq.shape}")
+#         print(f"high_freq shapes: {[hf.shape for hf in high_freq]}")
+
+        # 处理低频部分
+        low_freq = F.interpolate(low_freq, size=compressed_hr_feat.shape[-2:], mode='nearest')  # 恢复低频维度
+
+        # Debug: 检查 low_freq 的形状是否已恢复
+        # print(f"Resized low_freq shape: {low_freq.shape}")
+
+        # 处理高频部分
+        high_freq_combined = torch.cat([
+            # 将 5D 张量 [B, C, N, H, W] 转为 4D 张量 [B, C*N, H, W]
+            F.interpolate(hf.view(hf.shape[0], -1, hf.shape[-2], hf.shape[-1]),  # 展平 C 和 N
+                          size=compressed_hr_feat.shape[-2:], mode='nearest')
+            for hf in high_freq
+        ], dim=1)
+
+        # Debug: 确认 high_freq_combined 的最终形状
+        # print(f"high_freq_combined shape: {high_freq_combined.shape}")
+
         if self.semi_conv:
             if self.comp_feat_upsample:
                 if self.use_high_pass:
-                    mask_hr_hr_feat = self.content_encoder2(compressed_hr_feat) #从hr_feat得到初始高通滤波特征
-                    mask_hr_init = self.kernel_normalizer(mask_hr_hr_feat, self.highpass_kernel, hamming=self.hamming_highpass) #kernel归一化得到初始高通滤波
-                    compressed_hr_feat = compressed_hr_feat + compressed_hr_feat - carafe(compressed_hr_feat, mask_hr_init, self.highpass_kernel, self.up_group, 1) #利用初始高通滤波对压缩hr_feat的高频增强 （x-x的低通结果=x的高通结果）
-                    
-                    mask_lr_hr_feat = self.content_encoder(compressed_hr_feat) #从hr_feat得到初始低通滤波特征
-                    mask_lr_init = self.kernel_normalizer(mask_lr_hr_feat, self.lowpass_kernel, hamming=self.hamming_lowpass) #kernel归一化得到初始低通滤波
-                    
-                    mask_lr_lr_feat_lr = self.content_encoder(compressed_lr_feat) #从hr_feat得到另一部分初始低通滤波特征
-                    mask_lr_lr_feat = F.interpolate( #利用初始低通滤波对另一部分初始低通滤波特征上采样
-                        carafe(mask_lr_lr_feat_lr, mask_lr_init, self.lowpass_kernel, self.up_group, 2), size=compressed_hr_feat.shape[-2:], mode='nearest')
-                    mask_lr = mask_lr_hr_feat + mask_lr_lr_feat #将两部分初始低通滤波特征合在一起
+                    # 高频处理
+                    mask_hr_hr_feat = self.content_encoder3(high_freq_combined)  # 针对高频部分生成掩码
+                    mask_hr_init = self.kernel_normalizer(mask_hr_hr_feat, self.highpass_kernel, hamming=self.hamming_highpass)
+                    compressed_hr_feat = compressed_hr_feat + compressed_hr_feat - carafe(
+                        compressed_hr_feat, mask_hr_init, self.highpass_kernel, self.up_group, 1)
 
-                    mask_lr_init = self.kernel_normalizer(mask_lr, self.lowpass_kernel, hamming=self.hamming_lowpass) #得到初步融合的初始低通滤波
-                    mask_hr_lr_feat = F.interpolate( #使用初始低通滤波对lr_feat处理，分辨率得到提高
-                        carafe(self.content_encoder2(compressed_lr_feat), mask_lr_init, self.lowpass_kernel, self.up_group, 2), size=compressed_hr_feat.shape[-2:], mode='nearest')
-                    mask_hr = mask_hr_hr_feat + mask_hr_lr_feat # 最终高通滤波特征
-                else: raise NotImplementedError
+                    # 低频处理
+                    mask_lr_hr_feat = self.content_encoder(low_freq)  # 针对低频部分生成掩码
+                    mask_lr_init = self.kernel_normalizer(mask_lr_hr_feat, self.lowpass_kernel, hamming=self.hamming_lowpass)
+
+                    mask_lr_lr_feat_lr = self.content_encoder(compressed_lr_feat)
+                    mask_lr_lr_feat = F.interpolate(
+                        carafe(mask_lr_lr_feat_lr, mask_lr_init, self.lowpass_kernel, self.up_group, 2),
+                        size=compressed_hr_feat.shape[-2:], mode='nearest')
+                    mask_lr = mask_lr_hr_feat + mask_lr_lr_feat
+
+                    mask_lr_init = self.kernel_normalizer(mask_lr, self.lowpass_kernel, hamming=self.hamming_lowpass)
+                    mask_hr_lr_feat = F.interpolate(
+                        carafe(self.content_encoder2(compressed_lr_feat), mask_lr_init, self.lowpass_kernel, self.up_group, 2),
+                        size=compressed_hr_feat.shape[-2:], mode='nearest')
+                    mask_hr = mask_hr_hr_feat + mask_hr_lr_feat
+                else:
+                    raise NotImplementedError
             else:
-                mask_lr = self.content_encoder(compressed_hr_feat) + F.interpolate(self.content_encoder(compressed_lr_feat), size=compressed_hr_feat.shape[-2:], mode='nearest')
+                mask_lr = self.content_encoder(compressed_hr_feat) + F.interpolate(
+                    self.content_encoder(compressed_lr_feat), size=compressed_hr_feat.shape[-2:], mode='nearest')
                 if self.use_high_pass:
-                    mask_hr = self.content_encoder2(compressed_hr_feat) + F.interpolate(self.content_encoder2(compressed_lr_feat), size=compressed_hr_feat.shape[-2:], mode='nearest')
+                    mask_hr = self.content_encoder2(compressed_hr_feat) + F.interpolate(
+                        self.content_encoder2(compressed_lr_feat), size=compressed_hr_feat.shape[-2:], mode='nearest')
         else:
             compressed_x = F.interpolate(compressed_lr_feat, size=compressed_hr_feat.shape[-2:], mode='nearest') + compressed_hr_feat
             mask_lr = self.content_encoder(compressed_x)
-            if self.use_high_pass: 
+            if self.use_high_pass:
                 mask_hr = self.content_encoder2(compressed_x)
-        
+
+        # Normalize mask and ensure dimensions align
         mask_lr = self.kernel_normalizer(mask_lr, self.lowpass_kernel, hamming=self.hamming_lowpass)
+
+        # Ensure mask_lr matches lr_feat's size after scaling
+        target_h, target_w = lr_feat.shape[2] * 2, lr_feat.shape[3] * 2  # scale_factor=2
+        mask_lr = F.interpolate(mask_lr, size=(target_h, target_w), mode='nearest')
+
         if self.semi_conv:
-                lr_feat = carafe(lr_feat, mask_lr, self.lowpass_kernel, self.up_group, 2)
+            lr_feat = carafe(lr_feat, mask_lr, self.lowpass_kernel, self.up_group, 2)
         else:
             lr_feat = resize(
                 input=lr_feat,
@@ -262,27 +333,100 @@ class FreqFusion(nn.Module):
 
         if self.use_high_pass:
             mask_hr = self.kernel_normalizer(mask_hr, self.highpass_kernel, hamming=self.hamming_highpass)
+            mask_hr = F.interpolate(mask_hr, size=hr_feat.shape[-2:], mode='nearest')  # Match hr_feat size
             hr_feat_hf = hr_feat - carafe(hr_feat, mask_hr, self.highpass_kernel, self.up_group, 1)
             if self.hr_residual:
-                # print('using hr_residual')
                 hr_feat = hr_feat_hf + hr_feat
             else:
                 hr_feat = hr_feat_hf
 
         if self.feature_resample:
-            # print(lr_feat.shape)
-            lr_feat = self.dysampler(hr_x=compressed_hr_feat, 
+            lr_feat = self.dysampler(hr_x=compressed_hr_feat,
                                      lr_x=compressed_lr_feat, feat2sample=lr_feat)
-                
-        return  mask_lr, hr_feat, lr_feat
 
+        # 在输出前加入自注意力机制
+        hr_feat, lr_feat = self.self_attention_module(hr_feat, lr_feat)
 
+        return mask_lr, hr_feat, lr_feat
+#     def _forward(self, hr_feat, lr_feat):
+#         compressed_hr_feat = self.hr_channel_compressor(hr_feat)
+#         compressed_lr_feat = self.lr_channel_compressor(lr_feat)
+
+#         if self.semi_conv:
+#             if self.comp_feat_upsample:
+#                 if self.use_high_pass:
+#                     mask_hr_hr_feat = self.content_encoder2(compressed_hr_feat)
+#                     mask_hr_init = self.kernel_normalizer(mask_hr_hr_feat, self.highpass_kernel, hamming=self.hamming_highpass)
+#                     compressed_hr_feat = compressed_hr_feat + compressed_hr_feat - carafe(compressed_hr_feat, mask_hr_init, self.highpass_kernel, self.up_group, 1)
+
+#                     mask_lr_hr_feat = self.content_encoder(compressed_hr_feat)
+#                     mask_lr_init = self.kernel_normalizer(mask_lr_hr_feat, self.lowpass_kernel, hamming=self.hamming_lowpass)
+
+#                     mask_lr_lr_feat_lr = self.content_encoder(compressed_lr_feat)
+#                     mask_lr_lr_feat = F.interpolate(
+#                         carafe(mask_lr_lr_feat_lr, mask_lr_init, self.lowpass_kernel, self.up_group, 2),
+#                         size=compressed_hr_feat.shape[-2:], mode='nearest')
+#                     mask_lr = mask_lr_hr_feat + mask_lr_lr_feat
+
+#                     mask_lr_init = self.kernel_normalizer(mask_lr, self.lowpass_kernel, hamming=self.hamming_lowpass)
+#                     mask_hr_lr_feat = F.interpolate(
+#                         carafe(self.content_encoder2(compressed_lr_feat), mask_lr_init, self.lowpass_kernel, self.up_group, 2),
+#                         size=compressed_hr_feat.shape[-2:], mode='nearest')
+#                     mask_hr = mask_hr_hr_feat + mask_hr_lr_feat
+#                 else:
+#                     raise NotImplementedError
+#             else:
+#                 mask_lr = self.content_encoder(compressed_hr_feat) + F.interpolate(
+#                     self.content_encoder(compressed_lr_feat), size=compressed_hr_feat.shape[-2:], mode='nearest')
+#                 if self.use_high_pass:
+#                     mask_hr = self.content_encoder2(compressed_hr_feat) + F.interpolate(
+#                         self.content_encoder2(compressed_lr_feat), size=compressed_hr_feat.shape[-2:], mode='nearest')
+#         else:
+#             compressed_x = F.interpolate(compressed_lr_feat, size=compressed_hr_feat.shape[-2:], mode='nearest') + compressed_hr_feat
+#             mask_lr = self.content_encoder(compressed_x)
+#             if self.use_high_pass:
+#                 mask_hr = self.content_encoder2(compressed_x)
+
+#         # Normalize mask and ensure dimensions align
+#         mask_lr = self.kernel_normalizer(mask_lr, self.lowpass_kernel, hamming=self.hamming_lowpass)
+
+#         # Ensure mask_lr matches lr_feat's size after scaling
+#         target_h, target_w = lr_feat.shape[2] * 2, lr_feat.shape[3] * 2  # scale_factor=2
+#         mask_lr = F.interpolate(mask_lr, size=(target_h, target_w), mode='nearest')
+
+#         if self.semi_conv:
+#             lr_feat = carafe(lr_feat, mask_lr, self.lowpass_kernel, self.up_group, 2)
+#         else:
+#             lr_feat = resize(
+#                 input=lr_feat,
+#                 size=hr_feat.shape[2:],
+#                 mode=self.upsample_mode,
+#                 align_corners=None if self.upsample_mode == 'nearest' else self.align_corners)
+#             lr_feat = carafe(lr_feat, mask_lr, self.lowpass_kernel, self.up_group, 1)
+
+#         if self.use_high_pass:
+#             mask_hr = self.kernel_normalizer(mask_hr, self.highpass_kernel, hamming=self.hamming_highpass)
+#             mask_hr = F.interpolate(mask_hr, size=hr_feat.shape[-2:], mode='nearest')  # Match hr_feat size
+#             hr_feat_hf = hr_feat - carafe(hr_feat, mask_hr, self.highpass_kernel, self.up_group, 1)
+#             if self.hr_residual:
+#                 hr_feat = hr_feat_hf + hr_feat
+#             else:
+#                 hr_feat = hr_feat_hf
+
+#         if self.feature_resample:
+#             lr_feat = self.dysampler(hr_x=compressed_hr_feat,
+#                                      lr_x=compressed_lr_feat, feat2sample=lr_feat)
+
+#         # 在输出前加入自注意力机制
+#         hr_feat, lr_feat = self.self_attention_module(hr_feat, lr_feat)
+
+#         return mask_lr, hr_feat, lr_feat
 
 class LocalSimGuidedSampler(nn.Module):
     """
     offset generator in FreqFusion
     """
-    def __init__(self, in_channels, scale=2, style='lp', groups=4, use_direct_scale=True, kernel_size=1, local_window=3, sim_type='cos', norm=True, direction_feat='sim_concat'):
+    def __init__(self, in_channels, scale=2, style='lp', groups=4, use_direct_scale=True, kernel_size=1, local_window=3, sim_type='cos', norm=True, direction_feat='sim'):
         super().__init__()
         assert scale==2
         assert style=='lp'
@@ -427,15 +571,3 @@ def compute_similarity(input_tensor, k=3, dilation=1, sim='cos'):
     # 将结果重塑回[B, KxK-1, H, W]的形状
     similarity = similarity.view(B, k * k - 1, H, W)
     return similarity
-
-
-if __name__ == '__main__':
-    # x = torch.rand(4, 128, 16, 16)
-    # mask = torch.rand(4, 4 * 25, 16, 16)
-    # carafe(x, mask, kernel_size=5, group=1, up=2)
-
-    hr_feat = torch.rand(1, 128, 512, 512)
-    lr_feat = torch.rand(1, 128, 256, 256)
-    model = FreqFusion(hr_channels=128, lr_channels=128)
-    mask_lr, hr_feat, lr_feat = model(hr_feat=hr_feat, lr_feat=lr_feat)
-    print(mask_lr.shape)

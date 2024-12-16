@@ -1,10 +1,8 @@
-当然，我明白 README 的作用。下面是根据您提供的内容撰写的一个 GitHub 风格的 README 文件，包括两个链接：
 
----
 
 # Enhanced Frequency-Aware Feature Fusion for Semantic Segmentation
 
-[![GitHub](https://img.shields.io/badge/GitHub-It--is--really--easy-cv--finalword-blue.svg)](https://github.com/It-is-really-easy/cv-finalword/blob/main/FreqFusion.py)
+[![GitHub](https://img.shields.io/badge/GitHub-It--is--really--easy.svg)](https://github.com/It-is-really-easy/cv-finalword/blob/main/FreqFusion.py)
 [![Google Drive](https://img.shields.io/badge/Google%20Drive-Download%20Checkpoints-blue.svg)](https://drive.google.com/file/d/1yS2Nu-v0FeLse2ed3PF2aO6pAprYFXfZ/view?usp=drive_link)
 
 ## 介绍
